@@ -4,7 +4,7 @@ import subprocess
 import logging
 import asyncio
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -67,10 +67,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ Unauthorized.")
     kb = [["Help", "Write", "Record"]]
+    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
     await update.message.reply_text(
         "Hi, choose:",
-        reply_markup=ctx.bot.keyboard_parent(kb),
-        resize_keyboard=True
+        reply_markup=reply_markup
     )
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -125,7 +125,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asr_out = await run_blocking(somali_asr, wav_f.name)
         somali_text = asr_out.get("text", "").strip()
 
-        # Use local translator if available, else OpenAI
         if translator:
             trans_out = await run_blocking(translator, somali_text)
             english = trans_out[0]["translation_text"]

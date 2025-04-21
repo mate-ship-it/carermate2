@@ -4,7 +4,8 @@ import subprocess
 import logging
 import asyncio
 
-from telegram import Update, ChatAction
+from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -57,24 +58,32 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ Unauthorized.")
     kb = [["Help", "Write", "Record"]]
-    await update.message.reply_text("Hi, choose:", reply_markup=kb, resize_keyboard=True)
+    await update.message.reply_text(
+        "Hi, choose:", 
+        reply_markup=kb,
+        resize_keyboard=True
+    )
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ Unauthorized.")
-    text = update.message.text.strip().lower()
-    if text == "help":
+    txt = update.message.text.strip().lower()
+    if txt == "help":
         return await update.message.reply_text("🆘 How can I assist?")
-    if text == "write":
+    if txt == "write":
         return await update.message.reply_text("✍️ What would you like me to draft?")
-    if text == "record":
+    if txt == "record":
         return await update.message.reply_text("🎙️ Please send a voice note.")
 
     # STREAM GPT RESPONSE
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    await ctx.bot.send_chat_action(
+        chat_id=update.effective_chat.id, 
+        action=ChatAction.TYPING
+    )
     try:
         stream = openai.chat.completions.create(
-            model="gpt-4o", stream=True,
+            model="gpt-4o", 
+            stream=True,
             messages=[
                 {"role":"system","content":"You are a helpful assistant."},
                 {"role":"user",  "content":update.message.text}
@@ -86,8 +95,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             delta = chunk.choices[0].delta.get("content", "")
             if delta:
                 buffer += delta
-                await ctx.bot.edit_message_text(buffer,
-                    chat_id=msg.chat_id, message_id=msg.message_id)
+                await ctx.bot.edit_message_text(
+                    text=buffer,
+                    chat_id=msg.chat_id, 
+                    message_id=msg.message_id
+                )
     except Exception as e:
         logging.exception("GPT stream error")
         await update.message.reply_text(f"⚠️ Error: {e}")

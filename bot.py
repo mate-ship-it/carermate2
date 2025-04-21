@@ -1,5 +1,7 @@
 import os
 import tempfile
+import subprocess
+import logging
 import aiohttp
 
 from telegram import Update, ReplyKeyboardMarkup
@@ -10,34 +12,37 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-
 from dotenv import load_dotenv
 from openai import OpenAI
 from transformers import pipeline
 
+# ————— CONFIGURATION —————
+
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN             = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
-HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")  # if needed for private models
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")  # if needed
 
-# parse comma-separated IDs
+# parse comma-separated chat IDs
 raw_ids = os.getenv("AUTHORIZED_CHAT_ID", "")
 AUTHORIZED_CHAT_IDS = [int(x) for x in raw_ids.split(",") if x.strip().isdigit()]
 
+# instantiate OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # initialize the Somali ASR pipeline
-# if your Hugging Face model is public, you don't need HF token;
-# otherwise set env var HUGGINGFACE_API_TOKEN and uncomment the `use_auth_token` line below:
+# if your model is private, add use_auth_token=HUGGINGFACE_API_TOKEN
 somali_asr = pipeline(
     "automatic-speech-recognition",
     model="Mustafaa4a/ASR-Somali",
-    # use_auth_token=HUGGINGFACE_API_TOKEN
 )
 
 def is_authorized(chat_id: int) -> bool:
     return chat_id in AUTHORIZED_CHAT_IDS
+
+# ————— HANDLERS —————
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
@@ -51,7 +56,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
 
     text = update.message.text.strip()
-    low = text.lower()
+    low  = text.lower()
 
     if low == "help":
         return await update.message.reply_text("🆘 What do you need help with?")
@@ -69,44 +74,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
         await update.message.reply_text(resp.choices[0].message.content)
-    except Exception:
-        await update.message.reply_text("⚠️ Error while processing your message.")
+    except Exception as e:
+        logging.exception("Text handler failed")
+        await update.message.reply_text(f"⚠️ Error while processing your message: {e}")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
 
+    # Download the voice note as .ogg
     voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
+    tg_file = await voice.get_file()
+    ogg_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+    await tg_file.download_to_drive(ogg_tmp.name)
 
-    # download to temp .ogg
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file.file_path) as resp:
-                f.write(await resp.read())
-        audio_path = f.name
+    # Prepare a WAV temp file
+    wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
 
     try:
-        # 1) transcribe Somali audio
-        asr_result = somali_asr(audio_path)
-        os.remove(audio_path)
+        # Convert OGG → WAV via ffmpeg (ensure ffmpeg is installed in your container)
+        subprocess.run(
+            ["ffmpeg", "-i", ogg_tmp.name, wav_tmp.name, "-y", "-loglevel", "panic"],
+            check=True
+        )
 
-        somali_text = asr_result["text"]
-        # 2) translate Somali text into English via GPT-4
+        # 1) Transcribe with the Somali ASR model
+        asr_result = somali_asr(wav_tmp.name)
+        somali_text = asr_result.get("text", "").strip()
+
+        # Clean up audio files immediately
+        ogg_tmp.close(); wav_tmp.close()
+        os.remove(ogg_tmp.name); os.remove(wav_tmp.name)
+
+        # 2) Translate Somali → English using GPT-4o
         translation = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are a helpful translation assistant."},
-                {"role": "user",   "content": f"Translate this Somali text into English:\n\n{somali_text}"}
+                {
+                    "role": "user",
+                    "content": f"Translate this Somali text into English:\n\n{somali_text}"
+                }
             ]
         )
 
         await update.message.reply_text(translation.choices[0].message.content)
-    except Exception:
-        # cleanup if something went wrong
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        await update.message.reply_text("⚠️ Error while transcribing or translating your voice message.")
+
+    except Exception as e:
+        logging.exception("ASR/translation pipeline failed")
+        # ensure temp files are removed
+        for tmp in (ogg_tmp, wav_tmp):
+            try:
+                tmp.close()
+                os.remove(tmp.name)
+            except OSError:
+                pass
+        await update.message.reply_text(f"⚠️ Processing error: {e}")
+
+# ————— BOT SETUP —————
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not OPENAI_API_KEY or not AUTHORIZED_CHAT_IDS:
@@ -118,5 +143,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("🤖 Bot is running...")
+    print("🤖 Bot is running…")
     app.run_polling()

@@ -15,149 +15,114 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 from openai import OpenAI
+from transformers import pipeline  # Ensure transformers and sentencepiece are installed
 
-# Attempt to import translation pipeline; if sentencepiece is missing, we'll fall back
-try:
-    from transformers import pipeline
-    translator = pipeline("translation", model="Helsinki-NLP/opus-mt-cus-en")
-except Exception:
-    translator = None
-    logging.warning("Translation pipeline unavailable; will use OpenAI for translation.")
-
-# ASR pipeline (pre-cached in Docker image)
-from transformers import pipeline as _pipeline
-somali_asr = _pipeline("automatic-speech-recognition", model="Mustafaa4a/ASR-Somali")
-
-# ————— CONFIG —————
+# ————— CONFIGURATION & LOGGING —————
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
-AUTH_RAW     = os.getenv("AUTHORIZED_CHAT_ID", "").strip()
+# Validate environment
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+AUTH_RAW = os.getenv("AUTHORIZED_CHAT_ID", "").strip()
 if not BOT_TOKEN or not OPENAI_KEY or not AUTH_RAW:
-    raise SystemExit("Missing BOT_TOKEN, OPENAI_API_KEY, or AUTHORIZED_CHAT_ID")
-
+    logging.error("Missing BOT_TOKEN, OPENAI_API_KEY, or AUTHORIZED_CHAT_ID")
+    raise SystemExit("Configuration error")
 AUTHORIZED_IDS = {int(x) for x in AUTH_RAW.split(",") if x.isdigit()}
 if not AUTHORIZED_IDS:
-    raise SystemExit("No valid AUTHORIZED_CHAT_IDs")
+    logging.error("No valid AUTHORIZED_CHAT_IDs")
+    raise SystemExit("Configuration error")
 
-# OpenAI client
+# Initialize clients and pipelines
 openai = OpenAI(api_key=OPENAI_KEY)
-
-def authorized(chat_id: int) -> bool:
-    return chat_id in AUTHORIZED_IDS
+# ASR pipeline (pre-cached in Docker build)
+asr_pipeline = pipeline(
+    "automatic-speech-recognition",
+    model="Mustafaa4a/ASR-Somali"
+)
+# Translation pipeline requires sentencepiece>=0.1.97
+ttranslator = pipeline(
+    "translation",
+    model="Helsinki-NLP/opus-mt-cus-en"
+)
 
 # ————— HELPERS —————
-async def run_blocking(fn, *args, **kwargs):
+async def run_in_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
-async def download_voice(voice, target_path):
-    tg_file = await voice.get_file()
-    await tg_file.download_to_drive(target_path)
-
-def convert_ogg_to_wav(ogg_path, wav_path):
-    subprocess.run(
-        ["ffmpeg", "-i", ogg_path, wav_path, "-y", "-loglevel", "panic"],
-        check=True
-    )
+def is_authorized(chat_id: int) -> bool:
+    return chat_id in AUTHORIZED_IDS
 
 # ————— HANDLERS —————
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update.effective_chat.id):
+    if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ Unauthorized.")
-    kb = [["Help", "Write", "Record"]]
-    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
-    await update.message.reply_text(
-        "Hi, choose:",
-        reply_markup=reply_markup
-    )
+    kb = ReplyKeyboardMarkup([["Help","Write","Record"]], resize_keyboard=True)
+    await update.message.reply_text("Choose an option:", reply_markup=kb)
+    logging.info(f"Authorized start by {update.effective_chat.id}")
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update.effective_chat.id):
+    if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ Unauthorized.")
-    txt = update.message.text.strip().lower()
-    if txt == "help":
-        return await update.message.reply_text("🆘 How can I assist?")
-    if txt == "write":
-        return await update.message.reply_text("✍️ What would you like me to draft?")
-    if txt == "record":
-        return await update.message.reply_text("🎙️ Please send a voice note.")
+    text = update.message.text.strip()
+    low = text.lower()
+    if low in ("help","write","record"):
+        prompts = {"help":"🆘 How can I assist?","write":"✍️ What should I draft?","record":"🎙️ Please send a voice note."}
+        return await update.message.reply_text(prompts[low])
 
-    # STREAM GPT RESPONSE
-    await ctx.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING
-    )
+    # Send typing action
+    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
-        stream = openai.chat.completions.create(
-            model="gpt-4o", stream=True,
+        resp = await run_in_thread(
+            openai.chat.completions.create,
+            model="gpt-4o",
             messages=[
                 {"role":"system","content":"You are a helpful assistant."},
-                {"role":"user",  "content":update.message.text}
+                {"role":"user","content":text}
             ]
         )
-        msg = await update.message.reply_text("")  # placeholder
-        buffer = ""
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.get("content", "")
-            if delta:
-                buffer += delta
-                await ctx.bot.edit_message_text(
-                    text=buffer,
-                    chat_id=msg.chat_id,
-                    message_id=msg.message_id
-                )
+        await update.message.reply_text(resp.choices[0].message.content)
     except Exception as e:
-        logging.exception("GPT stream error")
+        logging.exception("Error in text handler")
         await update.message.reply_text(f"⚠️ Error: {e}")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update.effective_chat.id):
+    if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ Unauthorized.")
 
-    ogg_f = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
-    wav_f = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    ogg = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+    wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     try:
-        await download_voice(update.message.voice, ogg_f.name)
-        await run_blocking(convert_ogg_to_wav, ogg_f.name, wav_f.name)
-
-        asr_out = await run_blocking(somali_asr, wav_f.name)
-        somali_text = asr_out.get("text", "").strip()
-
-        if translator:
-            trans_out = await run_blocking(translator, somali_text)
-            english = trans_out[0]["translation_text"]
-        else:
-            resp = openai.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role":"system","content":"Translate Somali to English."},
-                    {"role":"user","content":somali_text}
-                ]
-            )
-            english = resp.choices[0].message.content
-
-        await update.message.reply_text(
-            f"🇸🇴 {somali_text}\n\n🇬🇧 {english}"
+        # Download .ogg
+        tg_file = await update.message.voice.get_file()
+        await tg_file.download_to_drive(ogg.name)
+        # Convert to WAV
+        await run_in_thread(
+            subprocess.run,
+            ["ffmpeg","-i",ogg.name,wav.name,"-y","-loglevel","panic"],
+            check=True
         )
-
+        # ASR
+        asr_res = await run_in_thread(asr_pipeline, wav.name)
+        somali_text = asr_res.get("text","<no transcription>")
+        # Translate
+        trans_res = await run_in_thread(tttranslator, somali_text)
+        english = trans_res[0].get("translation_text","<no translation>")
+        # Reply
+        await update.message.reply_text(f"🇸🇴 {somali_text}\n\n🇬🇧 {english}")
     except Exception as e:
-        logging.exception("Voice processing error")
+        logging.exception("Error in voice handler")
         await update.message.reply_text(f"⚠️ Error: {e}")
     finally:
-        for f in (ogg_f, wav_f):
-            try:
-                f.close()
-                os.remove(f.name)
-            except:
-                pass
+        for f in (ogg,wav):
+            try: os.remove(f.name)
+            except: pass
 
-# ————— BOT SETUP —————
+# ————— RUN —————
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    print("🤖 Bot live")
+    logging.info("Bot starting…")
     app.run_polling()

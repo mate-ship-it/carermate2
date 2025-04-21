@@ -15,7 +15,18 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 from openai import OpenAI
-from transformers import pipeline
+
+# Attempt to import translation pipeline; if sentencepiece is missing, we'll fall back
+try:
+    from transformers import pipeline
+    translator = pipeline("translation", model="Helsinki-NLP/opus-mt-cus-en")
+except Exception:
+    translator = None
+    logging.warning("Translation pipeline unavailable; will use OpenAI for translation.")
+
+# ASR pipeline (pre-cached in Docker image)
+from transformers import pipeline as _pipeline
+somali_asr = _pipeline("automatic-speech-recognition", model="Mustafaa4a/ASR-Somali")
 
 # ————— CONFIG —————
 load_dotenv()
@@ -31,10 +42,8 @@ AUTHORIZED_IDS = {int(x) for x in AUTH_RAW.split(",") if x.isdigit()}
 if not AUTHORIZED_IDS:
     raise SystemExit("No valid AUTHORIZED_CHAT_IDs")
 
-# API clients & pipelines
+# OpenAI client
 openai = OpenAI(api_key=OPENAI_KEY)
-somali_asr = pipeline("automatic-speech-recognition", model="Mustafaa4a/ASR-Somali")
-translator = pipeline("translation", model="Helsinki-NLP/opus-mt-cus-en")
 
 def authorized(chat_id: int) -> bool:
     return chat_id in AUTHORIZED_IDS
@@ -59,8 +68,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❌ Unauthorized.")
     kb = [["Help", "Write", "Record"]]
     await update.message.reply_text(
-        "Hi, choose:", 
-        reply_markup=kb,
+        "Hi, choose:",
+        reply_markup=ctx.bot.keyboard_parent(kb),
         resize_keyboard=True
     )
 
@@ -77,13 +86,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # STREAM GPT RESPONSE
     await ctx.bot.send_chat_action(
-        chat_id=update.effective_chat.id, 
+        chat_id=update.effective_chat.id,
         action=ChatAction.TYPING
     )
     try:
         stream = openai.chat.completions.create(
-            model="gpt-4o", 
-            stream=True,
+            model="gpt-4o", stream=True,
             messages=[
                 {"role":"system","content":"You are a helpful assistant."},
                 {"role":"user",  "content":update.message.text}
@@ -97,7 +105,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 buffer += delta
                 await ctx.bot.edit_message_text(
                     text=buffer,
-                    chat_id=msg.chat_id, 
+                    chat_id=msg.chat_id,
                     message_id=msg.message_id
                 )
     except Exception as e:
@@ -111,19 +119,30 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ogg_f = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
     wav_f = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     try:
-        # download & convert
         await download_voice(update.message.voice, ogg_f.name)
         await run_blocking(convert_ogg_to_wav, ogg_f.name, wav_f.name)
 
-        # ASR & translation off‑loaded
         asr_out = await run_blocking(somali_asr, wav_f.name)
         somali_text = asr_out.get("text", "").strip()
-        trans_out = await run_blocking(translator, somali_text)
-        english = trans_out[0]["translation_text"]
+
+        # Use local translator if available, else OpenAI
+        if translator:
+            trans_out = await run_blocking(translator, somali_text)
+            english = trans_out[0]["translation_text"]
+        else:
+            resp = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role":"system","content":"Translate Somali to English."},
+                    {"role":"user","content":somali_text}
+                ]
+            )
+            english = resp.choices[0].message.content
 
         await update.message.reply_text(
             f"🇸🇴 {somali_text}\n\n🇬🇧 {english}"
         )
+
     except Exception as e:
         logging.exception("Voice processing error")
         await update.message.reply_text(f"⚠️ Error: {e}")

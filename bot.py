@@ -17,7 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FASTAPI_URL = "https://web-production-80846.up.railway.app/transcribe"  # Change this to your FastAPI server URL
+FASTAPI_URL = "https://web-production-80846.up.railway.app/transcribe"
 
 # Parse authorized chat IDs
 raw_ids = os.getenv("AUTHORIZED_CHAT_ID", "")
@@ -42,15 +42,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
+    text = update.message.text.strip().lower()
 
-    text = update.message.text.strip()
-    low = text.lower()
-
-    if low == "help":
+    if text == "help":
         return await update.message.reply_text("🆘 What do you need help with?")
-    elif low == "write":
+    elif text == "write":
         return await update.message.reply_text("✍️ Please type what you'd like me to help you write.")
-    elif low == "record":
+    elif text == "record":
         return await update.message.reply_text("🎙️ Please send a voice message.")
 
     try:
@@ -63,40 +61,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(resp.choices[0].message.content)
     except Exception as e:
-        print(f"⚠️ Error: {e}")
+        print(f"⚠️ Text Error: {e}")
         await update.message.reply_text("⚠️ Error while processing your message.")
 
 # Handle voice messages
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
-
     voice = update.message.voice
+    if not voice:
+        return await update.message.reply_text("⚠️ No voice message detected.")
+
     file = await context.bot.get_file(voice.file_id)
 
-    # Download to temp .ogg
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file.file_path) as resp:
-                f.write(await resp.read())
-        audio_path = f.name
-
+    audio_path = ""
     try:
-        # 1) Send audio to FastAPI for Somali transcription
-        async with aiohttp.ClientSession() as session:
+        # Download to temp .ogg
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.get(file.file_path) as resp:
+                    f.write(await resp.read())
+            audio_path = f.name
+
+        # Send to FastAPI for transcription
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             with open(audio_path, "rb") as audio_file:
                 form = aiohttp.FormData()
                 form.add_field('file', audio_file, filename="voice.ogg", content_type='audio/ogg')
                 async with session.post(FASTAPI_URL, data=form) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        raise Exception(f"FastAPI Error {resp.status}: {error_text}")
                     fastapi_result = await resp.json()
                     somali_text = fastapi_result.get("transcription", "")
-
-        os.remove(audio_path)
 
         if not somali_text:
             return await update.message.reply_text("⚠️ Could not transcribe the voice message.")
 
-        # 2) Translate Somali text into English via GPT-4
+        # Translate via GPT-4
         translation = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -104,13 +106,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"role": "user", "content": f"Translate this Somali text into English:\n\n{somali_text}"}
             ]
         )
-
         await update.message.reply_text(translation.choices[0].message.content)
+
     except Exception as e:
-        print(f"⚠️ Error: {e}")
+        print(f"⚠️ Voice Error: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+    finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
-        await update.message.reply_text("⚠️ Error while transcribing or translating your voice message.")
 
 # Main app runner
 if __name__ == "__main__":
@@ -123,5 +127,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("🤖 Bot is running...")
-    app.run_polling()
+    print("🤖 Bot is running... Make sure only one instance is active.")
+    app.run_polling(close_loop=False)

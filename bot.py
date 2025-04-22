@@ -17,7 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FASTAPI_URL = "http://127.0.0.1:8000/transcribe"  # Change this to your FastAPI server URL
+FASTAPI_URL = "https://web-production-80846.up.railway.app/transcribe"  # Change this to your FastAPI server URL
 
 # Parse authorized chat IDs
 raw_ids = os.getenv("AUTHORIZED_CHAT_ID", "")

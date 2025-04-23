@@ -17,7 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FASTAPI_URL = os.getenv("FASTAPI_URL")  # Now from env var!
+FASTAPI_URL = os.getenv("FASTAPI_URL")
 
 # Parse authorized chat IDs
 raw_ids = os.getenv("AUTHORIZED_CHAT_ID", "")
@@ -92,26 +92,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if resp.status != 200:
                         error_text = await resp.text()
                         raise Exception(f"FastAPI Error {resp.status}: {error_text}")
-                    fastapi_result = await resp.json()
-                    print(f"🌍 FastAPI response: {fastapi_result}")
+
+                    try:
+                        fastapi_result = await resp.json()
+                        print(f"🌍 FastAPI response: {fastapi_result}")
+                    except Exception as parse_err:
+                        raw_text = await resp.text()
+                        raise Exception(f"Failed to parse FastAPI response. Raw: {raw_text}, Error: {parse_err}")
 
                     if not fastapi_result or not isinstance(fastapi_result, dict):
-                        raise Exception("FastAPI returned invalid response.")
+                        raise Exception(f"FastAPI returned invalid response: {fastapi_result}")
 
                     somali_text = fastapi_result.get("transcription", "")
+                    english_text = fastapi_result.get("translation", "")
 
         if not somali_text:
             return await update.message.reply_text("⚠️ Could not transcribe the voice message.")
 
-        # Translate the Somali text using GPT-4 - Direct English only
-        translation = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Translate this Somali text into English. Only return the English translation, no explanation."},
-                {"role": "user", "content": somali_text}
-            ]
-        )
-        await update.message.reply_text(translation.choices[0].message.content.strip())
+        if not english_text:
+            # Backup: If translation missing, fallback to GPT
+            translation = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Translate this Somali text into English. Only return the English translation, no explanation."},
+                    {"role": "user", "content": somali_text}
+                ]
+            )
+            english_text = translation.choices[0].message.content.strip()
+
+        await update.message.reply_text(english_text)
 
     except Exception as e:
         print(f"⚠️ Voice Error: {e}")

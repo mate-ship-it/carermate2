@@ -102,10 +102,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         translation = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a helpful translation assistant."},
-                {"role": "user", "content": f"Translate this Somali text into English:\n\n{somali_text}"}
+                {"role": "system", "content": "You are a helpful translation assistant. Only return the translated English text with no extra explanation."},
+                {"role": "user", "content": f"Translate this Somali text into English:\n\n{somali_text}"}    
             ]
-        )
+        
         await update.message.reply_text(translation.choices[0].message.content)
 
     except Exception as e:

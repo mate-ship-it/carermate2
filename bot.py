@@ -42,21 +42,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
-    text = update.message.text.strip().lower()
-
-    if text == "help":
-        return await update.message.reply_text("🆘 What do you need help with?")
-    elif text == "write":
-        return await update.message.reply_text("✍️ Please type what you'd like me to help you write.")
-    elif text == "record":
-        return await update.message.reply_text("🎙️ Please send a voice message.")
+    text = update.message.text.strip()
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a helpful translation assistant. Only return the direct English translation, no explanation."},
-                {"role": "user", "content": f"Translate this Somali text into English:\n\n{text}"}
+                {"role": "system", "content": "Translate this Somali text into English. Only return the English translation, no explanation."},
+                {"role": "user", "content": text}
             ]
         )
         await update.message.reply_text(resp.choices[0].message.content.strip())
@@ -76,35 +69,30 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audio_path = ""
 
     try:
-        # Download voice file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                 async with session.get(file.file_path) as resp:
                     f.write(await resp.read())
             audio_path = f.name
 
-        # Send audio to FastAPI ASR model
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             with open(audio_path, "rb") as audio_file:
                 form = aiohttp.FormData()
                 form.add_field('file', audio_file, filename="voice.ogg", content_type='audio/ogg')
                 async with session.post(FASTAPI_URL, data=form) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        raise Exception(f"FastAPI Error {resp.status}: {error_text}")
-
+                    print(f"🔗 FastAPI Status: {resp.status}")
                     try:
                         fastapi_result = await resp.json()
-                        print(f"🌍 FastAPI response: {fastapi_result}")
+                        print(f"📄 FastAPI Response: {fastapi_result}")
                     except Exception as parse_err:
                         raw_text = await resp.text()
                         raise Exception(f"Failed to parse FastAPI response. Raw: {raw_text}, Error: {parse_err}")
 
-                    if not fastapi_result or not isinstance(fastapi_result, dict):
-                        raise Exception(f"FastAPI returned invalid response: {fastapi_result}")
+        if not fastapi_result or not isinstance(fastapi_result, dict):
+            raise Exception(f"FastAPI returned invalid response: {fastapi_result}")
 
-                    somali_text = fastapi_result.get("transcription", "")
-                    english_text = fastapi_result.get("translation", "")
+        somali_text = fastapi_result.get("transcription")
+        english_text = fastapi_result.get("translation")
 
         if not somali_text:
             return await update.message.reply_text("⚠️ Could not transcribe the voice message.")

@@ -55,8 +55,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": text}
+                {"role": "system", "content": "You are a helpful translation assistant. Only return the direct English translation, no explanation."},
+                {"role": "user", "content": f"Translate this Somali text into English:\n\n{text}"}
             ]
         )
         await update.message.reply_text(resp.choices[0].message.content.strip())
@@ -93,17 +93,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         error_text = await resp.text()
                         raise Exception(f"FastAPI Error {resp.status}: {error_text}")
                     fastapi_result = await resp.json()
+                    print(f"🌍 FastAPI response: {fastapi_result}")
+
+                    if not fastapi_result or not isinstance(fastapi_result, dict):
+                        raise Exception("FastAPI returned invalid response.")
+
                     somali_text = fastapi_result.get("transcription", "")
 
         if not somali_text:
             return await update.message.reply_text("⚠️ Could not transcribe the voice message.")
 
-        # Translate the Somali text using GPT-4
+        # Translate the Somali text using GPT-4 - Direct English only
         translation = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a helpful translation assistant. Only return the translated English text with no extra explanation."},
-                {"role": "user", "content": f"Translate this Somali text into English:\n\n{somali_text}"}
+                {"role": "system", "content": "Translate this Somali text into English. Only return the English translation, no explanation."},
+                {"role": "user", "content": somali_text}
             ]
         )
         await update.message.reply_text(translation.choices[0].message.content.strip())

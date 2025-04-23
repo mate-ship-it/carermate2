@@ -17,7 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FASTAPI_URL = "https://j89w80nvhw0tyy-8000.proxy.runpod.net/transcribe"
+FASTAPI_URL = os.getenv("FASTAPI_URL")  # Now from env var!
 
 # Parse authorized chat IDs
 raw_ids = os.getenv("AUTHORIZED_CHAT_ID", "")
@@ -59,7 +59,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"role": "user", "content": text}
             ]
         )
-        await update.message.reply_text(resp.choices[0].message.content)
+        await update.message.reply_text(resp.choices[0].message.content.strip())
     except Exception as e:
         print(f"⚠️ Text Error: {e}")
         await update.message.reply_text("⚠️ Error while processing your message.")
@@ -73,17 +73,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⚠️ No voice message detected.")
 
     file = await context.bot.get_file(voice.file_id)
-
     audio_path = ""
+
     try:
-        # Download to temp .ogg
+        # Download voice file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                 async with session.get(file.file_path) as resp:
                     f.write(await resp.read())
             audio_path = f.name
 
-        # Send to FastAPI for transcription
+        # Send audio to FastAPI ASR model
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             with open(audio_path, "rb") as audio_file:
                 form = aiohttp.FormData()
@@ -98,15 +98,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not somali_text:
             return await update.message.reply_text("⚠️ Could not transcribe the voice message.")
 
-        # Translate via GPT-4
+        # Translate the Somali text using GPT-4
         translation = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are a helpful translation assistant. Only return the translated English text with no extra explanation."},
-                {"role": "user", "content": f"Translate this Somali text into English:\n\n{somali_text}"}    
+                {"role": "user", "content": f"Translate this Somali text into English:\n\n{somali_text}"}
             ]
-        
-        await update.message.reply_text(translation.choices[0].message.content)
+        )
+        await update.message.reply_text(translation.choices[0].message.content.strip())
 
     except Exception as e:
         print(f"⚠️ Voice Error: {e}")
@@ -118,7 +118,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Main app runner
 if __name__ == "__main__":
-    if not BOT_TOKEN or not OPENAI_API_KEY or not AUTHORIZED_CHAT_IDS:
+    if not BOT_TOKEN or not OPENAI_API_KEY or not AUTHORIZED_CHAT_IDS or not FASTAPI_URL:
         print("🚨 Missing env vars or no authorized chat IDs set.")
         exit(1)
 

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import time
+import asyncio
 import aiohttp
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -65,17 +66,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
-    voice = update.message.voice or update.message.voice_note if hasattr(update.message, 'voice_note') else None
+    # Only standard voice messages are supported
+    voice = update.message.voice
     if not voice:
-        return await update.message.reply_text("⚠️ No voice message detected.")
+        return await update.message.reply_text("⚠️ Please send a voice message (not a video note).")
 
     # Download voice file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
         audio_path = f.name
+    try:
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(custom_path=audio_path)
 
-    try:
         # Enqueue transcription
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             with open(audio_path, 'rb') as audio_file:
@@ -90,27 +92,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not task_id:
             raise Exception(f"No task_id in response: {data}")
 
-        # Poll for status
-        status = None
+        # Poll for status (max 30 retries)
         result = None
-        for _ in range(30):  # retry up to ~30s
+        for _ in range(30):  # ~30 seconds
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 async with session.get(f"{FASTAPI_URL}/status/{task_id}") as sresp:
                     if sresp.status != 200:
                         text = await sresp.text()
                         raise Exception(f"Status error {sresp.status}: {text}")
                     status_data = await sresp.json()
-            status = status_data.get('status')
-            if status == 'done':
+            state = status_data.get('status')
+            if state == 'done':
                 result = status_data.get('result', {})
                 break
-            if status == 'failure':
+            if state == 'failure':
                 error_msg = status_data.get('error', 'Unknown')
                 raise Exception(f"Task failed: {error_msg}")
             await asyncio.sleep(1)
 
-        if status != 'done':
-            return await update.message.reply_text("⚠️ Transcription timed out.")
+        if not result:
+            return await update.message.reply_text("⚠️ Transcription timed out. Please try again.")
 
         english = result.get('english') or result.get('translation')
         if not english:
@@ -121,23 +122,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"⚠️ Voice Error: {e}")
         await update.message.reply_text(f"⚠️ Error: {e}")
-
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
 # Bot startup
+
 def main():
     if not all([BOT_TOKEN, OPENAI_API_KEY, FASTAPI_URL, AUTHORIZED_CHAT_IDS]):
         print("🚨 Missing required environment variables or authorized IDs.")
         return
+    # Prevent multiple pollers
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("🤖 Bot is running...")
-    app.run_polling()
+    print("🤖 Bot is running... (only one instance should be active)")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()

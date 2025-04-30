@@ -1,7 +1,5 @@
 import os
 import tempfile
-import time
-import asyncio
 import aiohttp
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -19,13 +17,13 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FASTAPI_URL = os.getenv("FASTAPI_URL")  # e.g. https://your-domain.com
+FASTAPI_URL = os.getenv("FASTAPI_URL")
 
 # Parse authorized chat IDs
 raw_ids = os.getenv("AUTHORIZED_CHAT_ID", "")
 AUTHORIZED_CHAT_IDS = [int(x) for x in raw_ids.split(",") if x.strip().isdigit()]
 
-# Initialize OpenAI Client (for fallback translation)
+# Initialize OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Authorization Check
@@ -35,20 +33,24 @@ def is_authorized(chat_id: int) -> bool:
 # /start command handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
-        return await update.message.reply_text(
-            "❌ You are not authorised to use this bot."
-        )
+        return await update.message.reply_text("❌ You are not authorised to use this bot.")
     keyboard = [["Help", "Write", "Record"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(
-        "Hi! Please choose an option below:", reply_markup=reply_markup
-    )
+    await update.message.reply_text("Hi! Please choose an option below:", reply_markup=reply_markup)
 
-# Handle text messages (direct GPT fallback)
+# Handle text messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
-    text = update.message.text.strip()
+    text = update.message.text.strip().lower()
+
+    if text == "help":
+        return await update.message.reply_text("🆘 What do you need help with?")
+    elif text == "write":
+        return await update.message.reply_text("✍️ Please type what you'd like me to help you write.")
+    elif text == "record":
+        return await update.message.reply_text("🎙️ Please send a voice message.")
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -62,84 +64,82 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"⚠️ Text Error: {e}")
         await update.message.reply_text("⚠️ Error while processing your message.")
 
-# Handle voice messages with polling
+# Handle voice messages
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await update.message.reply_text("❌ You are not authorised to use this bot.")
-    # Only standard voice messages are supported
     voice = update.message.voice
     if not voice:
-        return await update.message.reply_text("⚠️ Please send a voice message (not a video note).")
+        return await update.message.reply_text("⚠️ No voice message detected.")
 
-    # Download voice file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
-        audio_path = f.name
+    file = await context.bot.get_file(voice.file_id)
+    audio_path = ""
+
     try:
-        file = await context.bot.get_file(voice.file_id)
-        await file.download_to_drive(custom_path=audio_path)
+        # Download voice file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.get(file.file_path) as resp:
+                    f.write(await resp.read())
+            audio_path = f.name
 
-        # Enqueue transcription
+        # Send audio to FastAPI ASR model
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            with open(audio_path, 'rb') as audio_file:
+            with open(audio_path, "rb") as audio_file:
                 form = aiohttp.FormData()
-                form.add_field('file', audio_file, filename=os.path.basename(audio_path), content_type='audio/ogg')
-                async with session.post(f"{FASTAPI_URL}/transcribe", data=form) as resp:
+                form.add_field('file', audio_file, filename="voice.ogg", content_type='audio/ogg')
+                async with session.post(FASTAPI_URL, data=form) as resp:
                     if resp.status != 200:
-                        text = await resp.text()
-                        raise Exception(f"FastAPI error {resp.status}: {text}")
-                    data = await resp.json()
-        task_id = data.get('task_id')
-        if not task_id:
-            raise Exception(f"No task_id in response: {data}")
+                        error_text = await resp.text()
+                        raise Exception(f"FastAPI Error {resp.status}: {error_text}")
 
-        # Poll for status (max 30 retries)
-        result = None
-        for _ in range(30):  # ~30 seconds
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(f"{FASTAPI_URL}/status/{task_id}") as sresp:
-                    if sresp.status != 200:
-                        text = await sresp.text()
-                        raise Exception(f"Status error {sresp.status}: {text}")
-                    status_data = await sresp.json()
-            state = status_data.get('status')
-            if state == 'done':
-                result = status_data.get('result', {})
-                break
-            if state == 'failure':
-                error_msg = status_data.get('error', 'Unknown')
-                raise Exception(f"Task failed: {error_msg}")
-            await asyncio.sleep(1)
+                    try:
+                        fastapi_result = await resp.json()
+                        print(f"🌍 FastAPI response: {fastapi_result}")
+                    except Exception as parse_err:
+                        raw_text = await resp.text()
+                        raise Exception(f"Failed to parse FastAPI response. Raw: {raw_text}, Error: {parse_err}")
 
-        if not result:
-            return await update.message.reply_text("⚠️ Transcription timed out. Please try again.")
+                    if not fastapi_result or not isinstance(fastapi_result, dict):
+                        raise Exception(f"FastAPI returned invalid response: {fastapi_result}")
 
-        english = result.get('english') or result.get('translation')
-        if not english:
-            raise Exception(f"No translation in result: {result}")
+                    somali_text = fastapi_result.get("transcription", "")
+                    english_text = fastapi_result.get("translation", "")
 
-        await update.message.reply_text(english)
+        if not somali_text:
+            return await update.message.reply_text("⚠️ Could not transcribe the voice message.")
+
+        if not english_text:
+            # Backup: If translation missing, fallback to GPT
+            translation = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Translate this Somali text into English. Only return the English translation, no explanation."},
+                    {"role": "user", "content": somali_text}
+                ]
+            )
+            english_text = translation.choices[0].message.content.strip()
+
+        await update.message.reply_text(english_text)
 
     except Exception as e:
         print(f"⚠️ Voice Error: {e}")
         await update.message.reply_text(f"⚠️ Error: {e}")
+
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-# Bot startup
+# Main app runner
+if __name__ == "__main__":
+    if not BOT_TOKEN or not OPENAI_API_KEY or not AUTHORIZED_CHAT_IDS or not FASTAPI_URL:
+        print("🚨 Missing env vars or no authorized chat IDs set.")
+        exit(1)
 
-def main():
-    if not all([BOT_TOKEN, OPENAI_API_KEY, FASTAPI_URL, AUTHORIZED_CHAT_IDS]):
-        print("🚨 Missing required environment variables or authorized IDs.")
-        return
-    # Prevent multiple pollers
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("🤖 Bot is running... (only one instance should be active)")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()
+    print("🤖 Bot is running... Make sure only one instance is active.")
+    app.run_polling(close_loop=False)
